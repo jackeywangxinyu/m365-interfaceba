@@ -103,8 +103,10 @@ export class WebSocket extends EventEmitter {
       const b = this.buffer, fin = Boolean(b[0] & 128), opcode = b[0] & 15;
       if ((b[0] & 112) || (b[1] & 128)) throw new Error('Invalid server frame flags');
       let length = b[1] & 127, offset = 2;
+      // `else if`: a 127-byte payload is sent with the 16-bit length 127, which must
+      // not then be re-read as the 64-bit length marker.
       if (length === 126) { if (b.length < 4) return; length = b.readUInt16BE(2); offset = 4; }
-      if (length === 127) {
+      else if (length === 127) {
         if (b.length < 10) return;
         const big = b.readBigUInt64BE(2);
         if (big > BigInt(this.maxBytes)) throw new Error('WebSocket frame too large');
