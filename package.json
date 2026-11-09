@@ -1,0 +1,9 @@
+{
+  "name": "m365-serve",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node src/cli.js serve", "test": "node --test" }
+}

@@ -1,0 +1,10 @@
+node_modules/
+.env
+*token*.json
+*token*.txt
+
+# Local credentials and browser session data
+.env.*
+!.env.example
+browser-profile/
+*.tmp
