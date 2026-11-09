@@ -6,7 +6,8 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startServer } from '../src/server.js';
-import { encodeFrame } from '../src/websocket.js';
+import { encodeFrame, WebSocket } from '../src/websocket.js';
+import { TurnText, cursorMessageId } from '../src/session.js';
 import { authorization, codeFromUrl, REDIRECT_URI, exchange, saveTokens, cachedTokenProvider } from '../src/oauth.js';
 import { createTokenProvider } from '../src/auth.js';
 
@@ -26,7 +27,7 @@ async function stub(t, answer = '你好') {
       while (buffer.length >= 2) {
         let n = buffer[1] & 127, off = 2;
         if (n === 126) { if(buffer.length<4) return; n=buffer.readUInt16BE(2); off=4; }
-        if (n === 127) { if(buffer.length<10) return; n=Number(buffer.readBigUInt64BE(2)); off=10; }
+        else if (n === 127) { if(buffer.length<10) return; n=Number(buffer.readBigUInt64BE(2)); off=10; }
         if(buffer.length<off+4+n) return;
         const mask=buffer.subarray(off,off+4), data=Buffer.from(buffer.subarray(off+4,off+4+n)), op=buffer[0]&15;
         for(let i=0;i<n;i++) data[i]^=mask[i%4];
@@ -37,8 +38,10 @@ async function stub(t, answer = '你好') {
         if(frames[0].protocol) socket.write(encodeFrame('{}\x1e',1,false));
         if(frames[0].target==='chat') {
           assert.equal(frames[1]?.target, 'Metrics', 'Metrics must share the chat WebSocket message');
-          const result = answer === 'DISENGAGED' ? { messages:[{author:'bot', messageType:'Disengaged'}] } : {writeAtCursor:answer};
-          const payload=JSON.stringify({type:1,target:'update',arguments:[result]})+'\x1e'+JSON.stringify({type:3,invocationId:'0'})+'\x1e';
+          // `answer` is either plain text or the exact list of update arguments to send.
+          const updates = Array.isArray(answer) ? answer
+            : [answer === 'DISENGAGED' ? { messages:[{author:'bot', messageType:'Disengaged'}] } : {writeAtCursor:answer}];
+          const payload=updates.map(u=>JSON.stringify({type:1,target:'update',arguments:[u]})+'\x1e').join('')+JSON.stringify({type:3,invocationId:'0'})+'\x1e';
           // Exercise fragmented messages and TCP frames split in the middle of a header.
           const a=encodeFrame(payload.slice(0,8),1,false); a[0]&=127;
           const b=encodeFrame(payload.slice(8),0,false);
@@ -91,6 +94,71 @@ test('Disengaged is surfaced as error',async t=>{
   const {post}=await stub(t,'DISENGAGED');
   const response=await post({messages:[{role:'user',content:'hi'}]});
   assert.equal(response.status,502); assert.equal((await response.json()).error.code,'m365_disengaged');
+});
+// M365's real stream shape: each bot message's first token arrives ONLY in a snapshot
+// that carries a cursor; writeAtCursor deltas (no message id) extend that message.
+const cur=id=>({j:`$['${id}'].adaptiveCards[0].body[0].text`,p:-1});
+const snap=(id,text,cursor=true)=>({...(cursor?{cursor:cur(id)}:{}),messages:[{author:'bot',messageId:id,text}]});
+const ONE_MESSAGE=[snap('m1','re'),{writeAtCursor:'vert'},{writeAtCursor:' the last commit'}];
+const TWO_MESSAGES=[
+  snap('m1','Let'),{writeAtCursor:' me check.'},snap('m1','Let me check.',false),
+  snap('m2','re'),{writeAtCursor:'vert it'},snap('m2','revert it',false),
+];
+test('the head token that arrives only in a snapshot is kept (revert, not vert)',async t=>{
+  const {post}=await stub(t,ONE_MESSAGE);
+  const response=await (await post({messages:[{role:'user',content:'undo'}]})).json();
+  assert.equal(response.choices[0].message.content,'revert the last commit');
+});
+test('a multi-message turn keeps every message head, in order',async t=>{
+  const {post}=await stub(t,TWO_MESSAGES);
+  const response=await (await post({messages:[{role:'user',content:'undo'}]})).json();
+  assert.equal(response.choices[0].message.content,'Let me check.\n\nrevert it');
+});
+test('streaming sends the head token too, exactly once',async t=>{
+  const {post}=await stub(t,TWO_MESSAGES);
+  const sse=await (await post({stream:true,messages:[{role:'user',content:'undo'}]})).text();
+  const content=sse.split('\n').filter(l=>l.startsWith('data: {')).map(l=>JSON.parse(l.slice(6)).choices[0].delta.content??'').join('');
+  assert.equal(content,'Let me check.\n\nrevert it');
+});
+test('TurnText routes deltas by the last cursor, not the last snapshot',()=>{
+  const text=new TurnText();
+  text.cursor('m1'); text.snapshot('m1','one');
+  text.cursor('m2'); text.snapshot('m2','two');
+  text.snapshot('m1','one!'); text.delta(' more');
+  assert.equal(text.text,'one!\n\ntwo more');
+  const legacy=new TurnText(); legacy.delta('plain'); legacy.delta(' deltas');
+  assert.equal(legacy.text,'plain deltas');
+  assert.equal(cursorMessageId("$['abc-1'].adaptiveCards[0].body[0].text"),'abc-1');
+  assert.equal(cursorMessageId(undefined),null);
+});
+test('WebSocket accepts binary frames like the ws package does',()=>{
+  const ws=Object.create(WebSocket.prototype);
+  Object.assign(ws,{buffer:Buffer.alloc(0),fragments:[],fragmentBytes:0,fragmented:false,binary:false,maxBytes:1e6});
+  const got=[]; ws.emit=(event,message)=>{ if(event==='message') got.push(message); };
+  ws.consume(Buffer.concat([encodeFrame(Buffer.from('{"type":6}\x1e'),2,false),encodeFrame('text',1,false)]));
+  assert.deepEqual(got,['{"type":6}\x1e','text']);
+});
+test('WebSocket reads every payload length across the 7/16/64-bit boundaries',async t=>{
+  // A 127-byte payload is sent with the 16-bit length 127; it used to be re-read as
+  // the 64-bit marker and fail with "WebSocket frame too large".
+  const sizes=[0,125,126,127,128,65535,65536];
+  const server=createServer(), sockets=new Set();
+  server.on('upgrade',(req,socket)=>{
+    sockets.add(socket);
+    const accept=createHash('sha1').update(req.headers['sec-websocket-key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    socket.write(Buffer.concat(sizes.map(n=>encodeFrame('x'.repeat(n),1,false))));
+  });
+  await new Promise(r=>server.listen(0,'127.0.0.1',r));
+  t.after(async()=>{ for(const s of sockets)s.destroy(); await new Promise(r=>server.close(r)); });
+  const ws=new WebSocket(`ws://127.0.0.1:${server.address().port}`);
+  const got=await new Promise((resolve,reject)=>{
+    const lengths=[];
+    ws.on('error',reject);
+    ws.on('message',m=>{ lengths.push(m.length); if(lengths.length===sizes.length) resolve(lengths); });
+  });
+  ws.terminate();
+  assert.deepEqual(got,sizes);
 });
 test('PKCE, state validation and exact redirect matching',()=>{
   const auth=authorization(); const u=new URL(auth.url);

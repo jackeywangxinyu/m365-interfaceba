@@ -433,9 +433,17 @@ function finishStream(
     response.write(streamChunk(streamId, model, { toolCalls: toolCalls.map(toOpenAiToolCall) }));
     response.write(streamChunk(streamId, model, { finishReason: "tool_calls" }));
   } else {
-    // If we streamed deltas the client already has the text; sending it again would
-    // duplicate the answer.
-    if (!alreadyStreamedText && text) response.write(streamChunk(streamId, model, { content: text }));
+    if (!alreadyStreamedText) {
+      if (text) response.write(streamChunk(streamId, model, { content: text }));
+    } else {
+      // The client already has what was streamed; resending it would duplicate the
+      // answer. Send only a tail the final text adds on top of it (a closing snapshot
+      // can be longer than the deltas were), and never anything that is not a suffix.
+      const streamed = result.streamed ?? "";
+      if (result.text.length > streamed.length && result.text.startsWith(streamed)) {
+        response.write(streamChunk(streamId, model, { content: result.text.slice(streamed.length) }));
+      }
+    }
     response.write(streamChunk(streamId, model, { finishReason: "stop" }));
   }
 

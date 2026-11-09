@@ -32,6 +32,9 @@ const RS = "\x1e";
 
 const DEFAULT_ENDPOINT = "wss://substrate.office.com";
 
+/** A turn fails only after this long with no frame at all (pings included). */
+const IDLE_TIMEOUT_MS = 180000;
+
 /** The upgrade is rejected without browser-shaped headers. */
 const BROWSER_HEADERS = {
   Origin: "https://m365.cloud.microsoft",
@@ -84,6 +87,54 @@ export function decodeJwt(token        )            {
   }
   if (!claims || typeof claims !== "object") throw new Error("Malformed JWT: payload is not an object");
   return claims             ;
+}
+
+/** The message id a streaming cursor names: `$['<messageId>'].adaptiveCards[0].body[0].text`. */
+export function cursorMessageId(path) {
+  const match = typeof path === "string" ? /^\$\['([^']+)'\]/.exec(path) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * Rebuild one turn's answer from M365's per-message stream.
+ *
+ * Each bot message streams the same way: its FIRST token arrives only inside a full
+ * snapshot (`messages[]`, with a `cursor` naming the message), then `writeAtCursor`
+ * deltas extend whatever message the last cursor named (they carry no message id),
+ * then a final snapshot. A turn can hold several messages — narration in one, a tool
+ * fence in the next.
+ *
+ * Concatenating only the deltas therefore drops the head of every message
+ * ("revert" arrives as snapshot "re" + delta "vert"), and comparing one global delta
+ * string against one snapshot cannot recover it once a turn has two messages. So text
+ * is kept per message and joined in order of first appearance.
+ */
+export class TurnText {
+  messages = new Map();
+  target = null;
+
+  /** Subsequent deltas extend message `id`. */
+  cursor(id) {
+    this.target = id;
+  }
+
+  /** A full-text snapshot of one message; the longer of it and what we hold wins. */
+  snapshot(id, text) {
+    const key = id ?? this.target ?? "";
+    if (this.target === null) this.target = key;
+    const current = this.messages.get(key) ?? "";
+    this.messages.set(key, text.length > current.length ? text : current);
+  }
+
+  /** A token delta for the message the cursor last named. */
+  delta(text) {
+    const key = this.target ?? "";
+    this.messages.set(key, (this.messages.get(key) ?? "") + text);
+  }
+
+  get text() {
+    return [...this.messages.values()].filter((text) => text.length > 0).join("\n\n");
+  }
 }
 
 /** M365 refused to engage with the prompt. Not a rate limit — do not retry into it. */
@@ -240,26 +291,47 @@ export class CopilotSession {
   /** Drive one turn to completion. */
           pump(socket           , outgoing                 , turn             )                      {
     return new Promise            ((resolve, reject) => {
-      let deltaText = "";
-      let snapshotText = "";
+      const text = new TurnText();
+      // The completion item's `result.message`: a fallback when no update carried text.
+      let finalMessage = "";
+      // What has gone out through `onDelta`. Streamed bytes cannot be retracted, so
+      // only a suffix that extends this exactly is ever emitted.
+      let streamed = "";
       let handshakeDone = false;
       let settled = false;
-      const deadline = setTimeout(() => finish(new Error("M365 turn timed out after 180 seconds")), 180000);
-      deadline.unref();
+      // An inactivity limit, not a turn limit: the server pings every few seconds, so
+      // silence this long means a dead connection, while a long answer that is still
+      // streaming is never cut off.
+      let idle;
+      const touch = () => {
+        clearTimeout(idle);
+        idle = setTimeout(() => finish(new Error(`M365 sent nothing for ${IDLE_TIMEOUT_MS / 1000} seconds`)), IDLE_TIMEOUT_MS);
+        idle.unref();
+      };
+      touch();
       const result             = { text: "" };
+
+      const advance = () => {
+        if (!turn.onDelta) return;
+        const now = text.text;
+        if (now.length > streamed.length && now.startsWith(streamed)) {
+          turn.onDelta(now.slice(streamed.length));
+          streamed = now;
+        }
+      };
 
       const finish = (error        ) => {
         if (settled) return;
         settled = true;
-        clearTimeout(deadline);
+        clearTimeout(idle);
         turn.signal?.removeEventListener("abort", onAbort);
         if (error) {
           reject(error);
           return;
         }
-        // The server sends the answer twice — incrementally and as a snapshot — and
-        // either can be the more complete one depending on where the turn ended.
-        result.text = deltaText.length >= snapshotText.length ? deltaText : snapshotText;
+        const composed = text.text;
+        result.text = composed.length >= finalMessage.length ? composed : finalMessage;
+        result.streamed = streamed;
         resolve(result);
       };
 
@@ -289,6 +361,7 @@ export class CopilotSession {
       });
 
       socket.on("message", (raw) => {
+        touch();
         for (const frame of splitFrames(raw.toString())) {
           // The handshake ack is `{}`; the chat frame goes out immediately after.
           if (!handshakeDone) {
@@ -302,21 +375,19 @@ export class CopilotSession {
             case 1:
               if (frame.target === "update") {
                 for (const argument of frame.arguments ?? []) {
-                  const applied = this.applyUpdate(argument, result, turn);
-                  if (applied.disengaged) {
+                  if (this.applyUpdate(argument, result, text)) {
                     finish(new DisengagedError());
                     return;
                   }
-                  deltaText += applied.delta;
-                  if (applied.snapshot.length > snapshotText.length) snapshotText = applied.snapshot;
                 }
+                advance();
               }
               break;
 
             case 2:
               this.applyStreamItem(frame.item, result);
-              if (frame.item?.result?.message && frame.item.result.message.length > snapshotText.length) {
-                snapshotText = frame.item.result.message;
+              if (typeof frame.item?.result?.message === "string" && frame.item.result.message.length > finalMessage.length) {
+                finalMessage = frame.item.result.message;
               }
               break;
 
@@ -422,19 +493,17 @@ export class CopilotSession {
     socket.send(`${JSON.stringify(chat)}${RS}${JSON.stringify(metrics)}${RS}`);
   }
 
-  /** Fold one `update` argument into the accumulating result. */
+  /** Fold one `update` argument into the turn's text. Returns true on Disengaged. */
           applyUpdate(
     argument     ,
     result            ,
-    turn             ,
-  )                                                           {
-    let deltaChunk = "";
-    let snapshot = "";
+    text          ,
+  )           {
+    // The cursor first: it names the message this argument's text belongs to.
+    const cursor = cursorMessageId(argument?.cursor?.j);
+    if (cursor) text.cursor(cursor);
 
-    if (typeof argument?.writeAtCursor === "string") {
-      deltaChunk = argument.writeAtCursor;
-      turn.onDelta?.(deltaChunk);
-    }
+    if (typeof argument?.writeAtCursor === "string") text.delta(argument.writeAtCursor);
 
     if (argument?.throttling) {
       result.throttle = {
@@ -445,14 +514,14 @@ export class CopilotSession {
 
     for (const message of argument?.messages ?? []) {
       if (message?.author !== "bot") continue;
-      if (message.messageType === "Disengaged") return { delta: deltaChunk, snapshot, disengaged: true };
+      if (message.messageType === "Disengaged") return true;
       // A messageType means control traffic, never the answer.
       if (message.messageType) continue;
-      if (typeof message.text === "string" && message.text.length > snapshot.length) snapshot = message.text;
+      if (typeof message.text === "string") text.snapshot(message.messageId, message.text);
       absorbMetadata(message, result);
     }
 
-    return { delta: deltaChunk, snapshot, disengaged: false };
+    return false;
   }
 
           applyStreamItem(item     , result            )       {

@@ -28,7 +28,9 @@ export class WebSocket extends EventEmitter {
   fragments = [];
   fragmentBytes = 0;
   fragmented = false;
-  maxBytes = 32 * 1024 * 1024;
+  binary = false;
+  // The `ws` package's default maxPayload, which the upstream plugin ran with.
+  maxBytes = 100 * 1024 * 1024;
   constructor(address, { headers = {} } = {}) {
     super();
     const url = new URL(address);
@@ -127,17 +129,19 @@ export class WebSocket extends EventEmitter {
       }
       if (opcode === 9) { this.socket.write(encodeFrame(data, 10)); continue; }
       if (opcode === 10) continue;
-      if (![0, 1].includes(opcode) || (opcode === 0 ? !this.fragmented : this.fragmented)) {
-        throw new Error('Invalid text continuation');
-      }
+      // 0 continues a message; 1 (text) and 2 (binary) start one. `ws` delivers both
+      // kinds and the session reads either as UTF-8, so a binary frame is not an error.
+      if (![0, 1, 2].includes(opcode)) throw new Error(`Unsupported WebSocket opcode ${opcode}`);
+      if (opcode === 0 ? !this.fragmented : this.fragmented) throw new Error('Invalid WebSocket continuation');
+      if (opcode !== 0) this.binary = opcode === 2;
       this.fragments.push(data); this.fragmentBytes += length;
       if (this.fragmentBytes > this.maxBytes) throw new Error('WebSocket message too large');
       this.fragmented = !fin;
       if (fin) {
         const message = Buffer.concat(this.fragments);
         this.fragments = []; this.fragmentBytes = 0;
-        // Reject invalid UTF-8 instead of silently replacing it.
-        this.emit('message', new TextDecoder('utf-8', { fatal: true }).decode(message));
+        // Text must be valid UTF-8 (RFC 6455): reject it rather than silently replace.
+        this.emit('message', this.binary ? message.toString('utf8') : new TextDecoder('utf-8', { fatal: true }).decode(message));
       }
     }
   }
